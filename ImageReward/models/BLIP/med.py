@@ -40,8 +40,22 @@ except ImportError:
     # Compatibility for later versions of transformers
     from transformers.modeling_utils import PreTrainedModel
     from transformers.pytorch_utils import apply_chunking_to_forward
-    from transformers.pytorch_utils import find_pruneable_heads_and_indices
     from transformers.pytorch_utils import prune_linear_layer
+
+    try:
+        # transformers < 5 exposed this in pytorch_utils.
+        from transformers.pytorch_utils import find_pruneable_heads_and_indices
+    except ImportError:
+        # transformers >= 5 dropped it — vendor the original implementation.
+        def find_pruneable_heads_and_indices(heads, n_heads, head_size, already_pruned_heads):
+            mask = torch.ones(n_heads, head_size)
+            heads = set(heads) - already_pruned_heads
+            for head in heads:
+                head = head - sum(1 if h < head else 0 for h in already_pruned_heads)
+                mask[head] = 0
+            mask = mask.view(-1).contiguous().eq(1)
+            index = torch.arange(len(mask))[mask].long()
+            return heads, index
 
 from transformers.utils import logging
 from transformers.models.bert.configuration_bert import BertConfig
@@ -555,6 +569,32 @@ class BertPreTrainedModel(PreTrainedModel):
     config_class = BertConfig
     base_model_prefix = "bert"
     _keys_to_ignore_on_load_missing = [r"position_ids"]
+
+    def tie_weights(self, *args, **kwargs):
+        # No output head is tied to the input embeddings in this BLIP BERT, and transformers >= 5
+        # reworked tie_weights (all_tied_weights_keys) in a way this vendored model doesn't populate.
+        # Tying is a no-op for inference here, so skip it to stay compatible across versions.
+        return
+
+    def get_head_mask(self, head_mask, num_hidden_layers, is_attention_chunked=False):
+        # transformers >= 5 dropped get_head_mask from ModuleUtilsMixin; vendor the original.
+        if head_mask is not None:
+            head_mask = self._convert_head_mask_to_5d(head_mask, num_hidden_layers)
+            if is_attention_chunked is True:
+                head_mask = head_mask.unsqueeze(-1)
+        else:
+            head_mask = [None] * num_hidden_layers
+        return head_mask
+
+    def _convert_head_mask_to_5d(self, head_mask, num_hidden_layers):
+        if head_mask.dim() == 1:
+            head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+        elif head_mask.dim() == 2:
+            head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+        assert head_mask.dim() == 5, f"head_mask.dim != 5, instead {head_mask.dim()}"
+        head_mask = head_mask.to(dtype=self.dtype)
+        return head_mask
 
     def _init_weights(self, module):
         """ Initialize the weights """
